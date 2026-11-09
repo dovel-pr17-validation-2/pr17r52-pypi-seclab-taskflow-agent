@@ -1,0 +1,260 @@
+# SPDX-FileCopyrightText: GitHub, Inc.
+# SPDX-License-Identifier: MIT
+
+"""Command-line interface for the seclab-taskflow-agent.
+
+Provides the Typer-based CLI entry point, replacing the previous argparse
+implementation. Supports personality mode (-p), taskflow mode (-t),
+model listing (-l), and global variables (-g KEY=VALUE).
+"""
+
+from __future__ import annotations
+
+__all__ = ["app", "main"]
+
+import asyncio
+import logging
+import os
+import sys
+import traceback
+from typing import Annotated
+
+import typer
+
+from .available_tools import AvailableTools
+from .banner import get_banner
+from .capi import get_AI_token, list_tool_call_models
+from .path_utils import log_file_name
+
+app = typer.Typer(
+    name="seclab-taskflow-agent",
+    help="SecLab Taskflow Agent — secure and automated workflow execution.",
+    add_completion=False,
+    no_args_is_help=True,
+)
+
+
+def _parse_global(value: str) -> tuple[str, str]:
+    """Parse a ``KEY=VALUE`` string into a (key, value) pair."""
+    if "=" not in value:
+        raise typer.BadParameter(f"Invalid global variable format: {value!r}. Expected KEY=VALUE.")
+    key, _, val = value.partition("=")
+    return key.strip(), val.strip()
+
+
+def _setup_logging() -> None:
+    """Configure root logger: file (DEBUG) + console (ERROR)."""
+    from logging.handlers import RotatingFileHandler
+
+    root = logging.getLogger("")
+    root.setLevel(logging.NOTSET)
+
+    file_handler = RotatingFileHandler(
+        log_file_name("task_agent.log"), maxBytes=10 * 1024 * 1024, backupCount=10
+    )
+    file_handler.setLevel(os.getenv("TASK_AGENT_LOGLEVEL", "DEBUG"))
+    file_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
+    root.addHandler(file_handler)
+
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.ERROR)
+    console_handler.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
+    root.addHandler(console_handler)
+
+
+def _print_concise_error(exc: BaseException) -> None:
+    """Print a concise error chain without full tracebacks.
+
+    Walks the exception cause chain and prints each error on a single
+    line.  Use ``--debug`` or ``TASK_AGENT_DEBUG=1`` for full tracebacks.
+    """
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current and id(current) not in seen:
+        seen.add(id(current))
+        label = type(current).__qualname__
+        typer.echo(f"Error: [{label}] {current}", err=True)
+        current = current.__cause__ or current.__context__
+    typer.echo("(use --debug for full traceback)", err=True)
+
+
+def _run_lint(available_tools, taskflow: str, *, strict: bool, cli_model_config: str | None) -> int:
+    """Lint a taskflow and print issues. Returns a process exit code."""
+    from .linting import format_issues, lint_taskflow
+
+    issues = lint_taskflow(available_tools, taskflow, strict=strict, cli_model_config=cli_model_config)
+    typer.echo(format_issues(issues))
+    return 1 if any(i.severity == "error" for i in issues) else 0
+
+
+def _dump_schemas() -> None:
+    """Print the JSON Schema for each grammar document type."""
+    import json
+
+    from .models import DOCUMENT_MODELS
+
+    schemas = {name: model.model_json_schema() for name, model in DOCUMENT_MODELS.items()}
+    typer.echo(json.dumps(schemas, indent=2))
+
+
+def _print_manifest(session_id: str) -> int:
+    """Print a session's run manifest as JSON. Returns a process exit code."""
+    import json
+
+    from .session import TaskflowSession
+
+    try:
+        session = TaskflowSession.load(session_id)
+    except FileNotFoundError as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        return 1
+    typer.echo(json.dumps(session.manifest(), indent=2))
+    return 0
+
+
+@app.command()
+def main(
+    personality: Annotated[
+        str | None,
+        typer.Option("-p", "--personality", help="Personality module path (mutually exclusive with -t)."),
+    ] = None,
+    taskflow: Annotated[
+        str | None,
+        typer.Option("-t", "--taskflow", help="Taskflow module path (mutually exclusive with -p)."),
+    ] = None,
+    list_models: Annotated[
+        bool,
+        typer.Option("-l", "--list-models", help="List available tool-call models and exit."),
+    ] = False,
+    globals_: Annotated[
+        list[str] | None,
+        typer.Option("-g", "--global", help="Global variable as KEY=VALUE. Repeatable."),
+    ] = None,
+    debug: Annotated[
+        bool,
+        typer.Option("-d", "--debug", help="Show full tracebacks on errors."),
+    ] = False,
+    resume: Annotated[
+        str | None,
+        typer.Option("--resume", help="Resume a previous session by its ID."),
+    ] = None,
+    prompt: Annotated[
+        list[str] | None,
+        typer.Argument(help="Remaining prompt text."),
+    ] = None,
+    model_config: Annotated[
+        str | None,
+        typer.Option("-m", "--model-config", help="Model configuration module path. Only relevant when running taskflows."),
+    ] = None,
+    lint: Annotated[
+        bool,
+        typer.Option("--lint", help="Validate a taskflow (-t) and its references offline, without running it."),
+    ] = False,
+    strict: Annotated[
+        bool,
+        typer.Option("--strict", help="With --lint, treat unknown fields as errors instead of warnings."),
+    ] = False,
+    dump_schema: Annotated[
+        bool,
+        typer.Option("--schema", help="Print the JSON Schema for each grammar document type and exit."),
+    ] = False,
+    manifest: Annotated[
+        str | None,
+        typer.Option("--manifest", help="Print the run manifest for a session ID and exit."),
+    ] = None,
+) -> None:
+    """Run a taskflow or personality-based agent session."""
+    # Debug mode from flag or env var
+    debug = debug or os.getenv("TASK_AGENT_DEBUG", "").strip().lower() in ("1", "true", "yes")
+
+    # Validate mutual exclusivity (resume is standalone)
+    if resume and (personality or taskflow or list_models):
+        typer.echo("Error: --resume cannot be combined with -p, -t, or -l.", err=True)
+        raise typer.Exit(code=1)
+
+    specified = sum(bool(x) for x in [personality, taskflow, list_models])
+    if specified > 1:
+        typer.echo("Error: -p, -t, and -l are mutually exclusive.", err=True)
+        raise typer.Exit(code=1)
+
+    _setup_logging()
+
+    available_tools = AvailableTools()
+
+    # Schema dump mode (no model calls, no taskflow required)
+    if dump_schema:
+        _dump_schemas()
+        raise typer.Exit()
+
+    # Manifest mode: print a session's run manifest and exit.
+    if manifest:
+        raise typer.Exit(code=_print_manifest(manifest))
+
+    # Lint mode (no model calls)
+    if lint:
+        if not taskflow:
+            typer.echo("Error: --lint requires -t/--taskflow.", err=True)
+            raise typer.Exit(code=1)
+        raise typer.Exit(code=_run_lint(available_tools, taskflow, strict=strict, cli_model_config=model_config))
+
+    # List models mode
+    if list_models:
+        tool_models = list_tool_call_models(get_AI_token())
+        for model in tool_models:
+            typer.echo(model)
+        raise typer.Exit()
+
+    if personality is None and taskflow is None and resume is None:
+        typer.echo("Error: one of -p, -t, or --resume is required.", err=True)
+        raise typer.Exit(code=1)
+
+    # Parse global variables
+    cli_globals: dict[str, str] = {}
+    for g in globals_ or []:
+        key, val = _parse_global(g)
+        cli_globals[key] = val
+
+    user_prompt = " ".join(prompt) if prompt else ""
+
+    typer.echo(get_banner())
+
+    from .runner import run_main
+
+    # When resuming, the session carries taskflow_path/globals/prompt
+    effective_taskflow = taskflow if not resume else None
+
+    exit_code = 0
+    try:
+        asyncio.run(
+            run_main(
+                available_tools, personality, effective_taskflow,
+                cli_globals, user_prompt, resume_session_id=resume, cli_model_config=model_config,
+            ),
+            debug=debug,
+        )
+    except KeyboardInterrupt:
+        typer.echo("\nInterrupted.", err=True)
+        exit_code = 130
+    except Exception as exc:
+        if debug:
+            traceback.print_exc()
+        else:
+            _print_concise_error(exc)
+        exit_code = 1
+
+    # Force-exit at the CLI boundary. Python's shutdown path can spin on
+    # dangling asyncio tasks or half-open sockets (notably through the
+    # Responses API + MCP combination), which blocks the interpreter
+    # from returning even after asyncio.run() completes. Tests that
+    # invoke run_main() directly never hit this path.
+    logging.shutdown()
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(exit_code)
+
+
+# ---------------------------------------------------------------------------
+# Legacy compatibility shim — implementation moved to prompt_parser.py
+# ---------------------------------------------------------------------------
+
+from .prompt_parser import parse_prompt_args as parse_prompt_args  # noqa: E402

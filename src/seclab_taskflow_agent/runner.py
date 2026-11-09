@@ -1,0 +1,1538 @@
+# SPDX-FileCopyrightText: GitHub, Inc.
+# SPDX-License-Identifier: MIT
+
+"""Taskflow execution engine.
+
+Contains the core logic for deploying task agents, executing taskflows,
+and managing the agent lifecycle. Extracted from the original monolithic
+``__main__.py``.
+"""
+
+from __future__ import annotations
+
+__all__ = [
+    "DEFAULT_MAX_TURNS",
+    "MAX_RATE_LIMIT_BACKOFF",
+    "RATE_LIMIT_BACKOFF",
+    "deploy_task_agents",
+    "run_main",
+]
+
+import asyncio
+import logging
+import time
+import uuid
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any
+
+import jinja2
+from jsonschema.exceptions import ValidationError
+
+from ._stream import drive_backend_stream
+from ._watchdog import start_watchdog, watchdog_ping
+from .agent import DEFAULT_MODEL, TaskAgentHooks, TaskRunHooks
+from .available_tools import AvailableTools
+from .env_utils import TmpEnv
+from .mcp_lifecycle import MCP_CLEANUP_TIMEOUT, build_mcp_servers, mcp_session_task
+from .mcp_prompt import mcp_system_prompt
+from .mcp_utils import compress_name, mcp_client_params
+from .models import ModelConfigDocument, PersonalityDocument, TaskDefinition
+from .render_utils import OutputRouter, flush_async_output, render_model_output, use_output_router
+from .results import (
+    ResultStore,
+    ToolResult,
+    UsageAccumulator,
+    decode_tool_result,
+    normalize_openai_tool_output,
+)
+from .output_schema import validate_output
+from .sdk import AgentSpec, MCPServerSpec, get_backend, resolve_backend_name
+from .sdk.errors import (
+    BackendBadRequestError,
+    BackendMaxTurnsError,
+    BackendTimeoutError,
+    BackendTransportError,
+    BackendUnexpectedError,
+)
+from .shell_utils import shell_tool_call
+from .template_utils import evaluate_expression, render_template
+
+if TYPE_CHECKING:  # Hook callbacks still use openai-agents types; fully decoupling them is a later slice.
+    from agents import Agent, RunContextWrapper, TContext, Tool
+
+DEFAULT_MAX_TURNS = 50  # Maximum agent turns before forced termination
+RATE_LIMIT_BACKOFF = 5  # Initial backoff in seconds after a rate-limit response
+MAX_RATE_LIMIT_BACKOFF = 120  # Maximum backoff cap in seconds for rate-limit retries
+TASK_RETRY_LIMIT = 3  # Maximum retry attempts for a failed branch
+TASK_RETRY_BACKOFF = 10  # Initial backoff in seconds between branch retries
+
+# Retried once, at the branch, and nowhere else.
+#
+# Neutral types only. A response stream cut mid-body is translated into
+# BackendTransportError by the backend adapters, which is where SDK and
+# transport knowledge belongs (see sdk/errors.py and sdk/_transport.py), so
+# the runner needs no SDK or httpx import of its own.
+#
+# The branch is the single owner of transient retry, because it is the only
+# level that can do it correctly. It resets capture state between attempts,
+# so a tool result recorded before a failure cannot be published twice or
+# become the task's named output via sink[-1]. It replays only the failed
+# branch, leaving siblings that already ran -- and already wrote to external
+# systems -- alone. And it is the only level that works for concurrent
+# fan-out at all, which converts branch exceptions to False before any outer
+# loop can see them.
+#
+# Nothing above this retries these classes. Retry loops nest here, so a class
+# caught at two levels multiplies rather than adds: when drive_backend_stream
+# retried BackendTimeoutError in place and the task loop retried it again,
+# the sequential path measured 6 x 3 x 3 = 54 full agent turns, each one
+# replaying the whole conversation.
+#
+# The builtins are included because branch code can raise them directly; no
+# httpx exception inherits from either, which is why they never caught a
+# dropped response stream.
+_BRANCH_RETRIABLE_ERRORS: tuple[type[BaseException], ...] = (
+    BackendTransportError,
+    BackendTimeoutError,
+    ConnectionError,
+    TimeoutError,
+)
+
+
+def _resolve_model_config(
+    available_tools: AvailableTools,
+    model_config_ref: str,
+) -> tuple[list[str], dict[str, str], dict[str, dict[str, Any]], str, str | None]:
+    """Load and validate the model configuration file.
+
+    Args:
+        available_tools: Tool registry used to load the config file.
+        model_config_ref: Reference name for the model config document.
+
+    Returns:
+        A tuple of (model_keys, model_dict, models_params, api_type, backend)
+        where model_keys is the list of logical model names, model_dict maps
+        them to provider model IDs, models_params holds per-model settings,
+        api_type is ``"chat_completions"`` or ``"responses"``, and backend
+        is the optional SDK adapter name from the config (``None`` when
+        unset — the runner then falls back to env/endpoint resolution).
+
+    Raises:
+        ValueError: If the config file has structural problems.
+    """
+    m_config: ModelConfigDocument = available_tools.get_model_config(model_config_ref)
+    model_dict: dict[str, str] = m_config.models or {}
+    model_keys: list[str] = list(model_dict.keys())
+    models_params: dict[str, dict[str, Any]] = m_config.model_settings or {}
+    unknown = set(models_params) - set(model_keys)
+    if unknown:
+        raise ValueError(
+            f"Settings section of model_config file {model_config_ref} contains models not in the model section: {unknown}"
+        )
+    return model_keys, model_dict, models_params, m_config.api_type, m_config.backend
+
+
+def _merge_reusable_task(
+    available_tools: AvailableTools,
+    task: TaskDefinition,
+) -> TaskDefinition:
+    """Merge a reusable taskflow into the current task definition.
+
+    Args:
+        available_tools: Tool registry used to load the reusable taskflow.
+        task: Current task whose ``uses`` field references a reusable taskflow.
+
+    Returns:
+        A new TaskDefinition with parent defaults filled in where the current
+        task uses its own defaults.
+
+    Raises:
+        ValueError: If the reusable taskflow is missing or has more than 1 task.
+    """
+    reusable_doc = available_tools.get_taskflow(task.uses)
+    if reusable_doc is None:
+        raise ValueError(f"No such reusable taskflow: {task.uses}")
+    if len(reusable_doc.taskflow) > 1:
+        raise ValueError("Reusable taskflows can only contain 1 task")
+    parent_task = reusable_doc.taskflow[0].task
+    merged: dict[str, Any] = parent_task.model_dump(by_alias=True, exclude_defaults=True)
+    current: dict[str, Any] = task.model_dump(by_alias=True, exclude_defaults=True)
+    merged.update(current)
+    return TaskDefinition.model_validate(merged)
+
+
+def _resolve_one_model(
+    logical_name: str,
+    task_model_settings: dict[str, Any],
+    model_keys: list[str],
+    model_dict: dict[str, str],
+    models_params: dict[str, dict[str, Any]],
+    default_api_type: str = "chat_completions",
+) -> tuple[str, dict[str, Any], str, str | None, str | None, str | None]:
+    """Resolve one logical model name plus overrides into a concrete spec.
+
+    Shared core for both the singular ``model:`` field and each entry of the
+    multi-model ``models:`` list. *task_model_settings* are the per-task (or
+    per-entry) overrides that win over the ``model_config`` settings.
+
+    Returns:
+        A tuple of ``(model_id, model_settings, api_type, endpoint, token, backend)``
+        where *endpoint*, *token*, and *backend* are ``None`` when not overridden.
+    """
+    model_settings: dict[str, Any] = {}
+    api_type: str = default_api_type
+    endpoint: str | None = None
+    token: str | None = None
+    backend: str | None = None
+
+    if logical_name in model_keys:
+        if logical_name in models_params:
+            model_settings = models_params[logical_name].copy()
+        logical_name = model_dict[logical_name]
+
+    # Extract engine-level keys before merging task settings
+    api_type = model_settings.pop("api_type", api_type)
+    endpoint = model_settings.pop("endpoint", None)
+    token = model_settings.pop("token", None)
+    backend = model_settings.pop("backend", None)
+
+    # Task/entry-level overrides can also set engine keys
+    task_settings = dict(task_model_settings)
+    api_type = task_settings.pop("api_type", api_type)
+    endpoint = task_settings.pop("endpoint", endpoint)
+    token = task_settings.pop("token", token)
+    backend = task_settings.pop("backend", backend)
+
+    model_settings.update(task_settings)
+    return logical_name, model_settings, api_type, endpoint, token, backend
+
+
+def _resolve_task_model(
+    task: TaskDefinition,
+    model_keys: list[str],
+    model_dict: dict[str, str],
+    models_params: dict[str, dict[str, Any]],
+    default_api_type: str = "chat_completions",
+) -> tuple[str, dict[str, Any], str, str | None, str | None, str | None]:
+    """Resolve the final model name, settings, and per-model overrides.
+
+    Returns:
+        A tuple of ``(model_id, model_settings, api_type, endpoint, token, backend)``
+        where *endpoint*, *token*, and *backend* are ``None`` when not overridden.
+
+    Raises:
+        ValueError: If task-level model_settings is not a dictionary.
+    """
+    task_model_settings: dict[str, Any] | Any = task.model_settings or {}
+    if not isinstance(task_model_settings, dict):
+        raise ValueError(f"model_settings in task {task.name or ''} needs to be a dictionary")
+    return _resolve_one_model(
+        task.model or DEFAULT_MODEL,
+        task_model_settings,
+        model_keys,
+        model_dict,
+        models_params,
+        default_api_type,
+    )
+
+
+@dataclass(frozen=True)
+class ResolvedModel:
+    """A fully resolved model spec for one branch of a (multi-)model task."""
+
+    model: str
+    model_settings: dict[str, Any]
+    api_type: str
+    endpoint: str | None
+    token: str | None
+    backend: str | None
+    label: str
+
+
+@dataclass
+class _Branch:
+    """One (prompt, model) cell of a task's execution matrix.
+
+    Every branch captures its tool results into a private ``sink`` (never the
+    shared store) so concurrent branches stay isolated; the runner projects
+    single-model sinks back into the shared store afterwards and aggregates all
+    branch results for fan-in (see the capture design note below).
+    """
+
+    agents: dict[str, Any]
+    prompt: str
+    rm: ResolvedModel
+    item_index: int
+    label: str
+    sink: list[ToolResult] = field(default_factory=list)
+    # Final response text captured for ``capture: response`` tasks (the prose
+    # the agent emitted after its last tool call). ``None`` until the branch's
+    # stream completes; the capture layer wraps it as a synthetic tool result
+    # so response and tool-result capture share one decode/validate path.
+    message: str | None = None
+    # Typed multi-model output: when the task declares an ``outputs`` schema,
+    # each branch's result is validated and the value stored here
+    # (``None`` when the branch failed or violated the schema). ``output_set``
+    # marks that validation ran so fan-in uses this value instead of decoding
+    # the raw sink.
+    output: Any = None
+    output_set: bool = False
+
+
+# ---------------------------------------------------------------------------
+# Task result/output capture model (unified across repeat_prompt + multi-model)
+#
+# Every prompt task fans out into one or more branches: the cross product of
+# the prompts to run (one for a plain task, N for ``repeat_prompt``) and the
+# resolved models (one for a single-model task, M for a multi-model task). Each
+# branch captures its own tool results into an isolated ``_Branch.sink`` (never
+# the shared store), so concurrent branches never interleave and capture is the
+# same shape regardless of which axis (items, models, or both) fanned out.
+#
+# After the branches run, the runner does two things:
+#
+#  1. Carry-over projection. For single-model tasks it replays the branch sinks
+#     into the shared run ``store`` in branch order, so the legacy implicit
+#     last-tool-result carry-over, the run-level result list, and the session
+#     snapshot behave exactly as before (and deterministically, even for async
+#     ``repeat_prompt``). Multi-model tasks are deliberately excluded: there is
+#     no well-defined "last" result across models, so their results are consumed
+#     by name via ``id``/``over``, not the implicit channel.
+#
+#  2. Named-output capture (``outputs.<id>``), by whether the task fanned out:
+#       - does NOT fan out (plain single-model task) -> the single decoded value
+#         (validated against the ``outputs`` schema here; a violation is a hard
+#         task failure). See :func:`_capture_task_output`.
+#       - fans out (``repeat_prompt`` or multiple models) -> the per-branch
+#         fan-in list ``[{model, item, result}]`` (each ``result`` validated
+#         per branch during the run; a violation is a failed branch reduced by
+#         the ``completion`` policy). See :func:`_aggregate_fanin` /
+#         :func:`_capture_branch_output`.
+#
+# "Fans out" is structural (``repeat_prompt or multi_model``), not a runtime
+# count, so a ``repeat_prompt`` over one item is still a one-element list rather
+# than surprising the author with a scalar.
+# ---------------------------------------------------------------------------
+
+
+def _branch_result_source(branch: _Branch, *, capture_response: bool) -> ToolResult | None:
+    """Return the raw result this branch captured, as a ``ToolResult``.
+
+    For ``capture: response`` the agent's final response text is wrapped in a
+    synthetic :class:`ToolResult` so response and tool-result capture share the
+    same decode/validate path; ``None`` when the branch produced no response.
+    Otherwise the branch's last real tool result is returned (``None`` when its
+    sink is empty).
+    """
+    if capture_response:
+        return ToolResult(text=branch.message) if branch.message is not None else None
+    return branch.sink[-1] if branch.sink else None
+
+
+def _aggregate_fanin(branches: list[_Branch], *, capture_response: bool = False) -> list[dict[str, Any]]:
+    """Aggregate each branch's final result into fan-in records.
+
+    Produces one record per branch: ``{"model": <label>, "item": <index>,
+    "result": <value>}``. ``result`` is the decoded final result of the branch
+    -- its last tool result, or its final response text when the task uses
+    ``capture: response`` -- (its raw text when not JSON, or ``None`` when the
+    branch produced nothing). When the task declares an ``outputs`` schema,
+    ``result`` is the per-branch validated value instead (``None`` for a branch
+    that failed or violated the schema). Used to expose multi-model /
+    cross-product outputs to later tasks as ``outputs.<id>``.
+    """
+    records: list[dict[str, Any]] = []
+    for branch in branches:
+        if branch.output_set:
+            value: Any = branch.output
+        else:
+            value = None
+            source = _branch_result_source(branch, capture_response=capture_response)
+            if source is not None:
+                try:
+                    value = decode_tool_result(source)
+                except ValueError:
+                    value = source.text
+        records.append({"model": branch.rm.label, "item": branch.item_index, "result": value})
+    return records
+
+
+def _capture_branch_output(
+    branch: _Branch,
+    schema: dict[str, Any],
+    *,
+    agent_ok: bool,
+    capture_response: bool = False,
+) -> bool:
+    """Validate one multi-model branch's result against the task's outputs schema.
+
+    Stores the validated value on ``branch.output`` (``None`` when the branch
+    failed to run or its result violates the contract) and returns whether the
+    branch both ran and produced a schema-valid result. A contract violation is
+    therefore surfaced as a failed branch, which the task's ``completion`` policy
+    (``all`` / ``any``) reduces like any other branch failure. The validated
+    value is the branch's last tool result, or its final response text when the
+    task uses ``capture: response``.
+    """
+    branch.output_set = True
+    branch.output = None
+    if not agent_ok:
+        return False
+    source = _branch_result_source(branch, capture_response=capture_response)
+    if source is None:
+        logging.error(
+            "Multi-model branch %r produced no result to validate against 'outputs'",
+            branch.label,
+        )
+        return False
+    try:
+        value = decode_tool_result(source)
+    except ValueError:
+        value = source.text
+    try:
+        branch.output = validate_output(schema, value)
+        return True
+    except (ValidationError, ValueError) as exc:
+        logging.error(
+            "Multi-model branch %r output violated 'outputs' schema: %s",
+            branch.label,
+            exc,
+        )
+        return False
+
+
+def _resolve_task_models(
+    task: TaskDefinition,
+    model_keys: list[str],
+    model_dict: dict[str, str],
+    models_params: dict[str, dict[str, Any]],
+    default_api_type: str = "chat_completions",
+) -> list[ResolvedModel]:
+    """Resolve every model this task runs against.
+
+    Single-model tasks yield a one-element list (equivalent to
+    :func:`_resolve_task_model`); multi-model tasks yield one
+    :class:`ResolvedModel` per ``models`` entry. The ``label`` is the
+    user-facing logical name (falling back to the resolved provider id) and
+    is used to tag per-model output streams.
+    """
+    resolved: list[ResolvedModel] = []
+    for entry in task.effective_model_entries():
+        entry_settings: dict[str, Any] | Any = entry.model_settings or {}
+        if not isinstance(entry_settings, dict):
+            raise ValueError(f"model_settings in task {task.name or ''} needs to be a dictionary")
+        model_id, settings, api_type, endpoint, token, backend = _resolve_one_model(
+            entry.model or DEFAULT_MODEL,
+            entry_settings,
+            model_keys,
+            model_dict,
+            models_params,
+            default_api_type,
+        )
+        resolved.append(
+            ResolvedModel(
+                model=model_id,
+                model_settings=settings,
+                api_type=api_type,
+                endpoint=endpoint,
+                token=token,
+                backend=backend,
+                label=entry.model or model_id,
+            )
+        )
+    return resolved
+
+
+def _completion(oks: list[bool], policy: str) -> bool:
+    """Reduce per-branch success flags to a single task result.
+
+    An empty branch list is treated as success (nothing ran, nothing
+    failed), matching the pre-multi-model behaviour. ``"any"`` succeeds if
+    at least one branch succeeded; ``"all"`` (the default) requires every
+    branch to succeed.
+    """
+    if not oks:
+        return True
+    if policy == "any":
+        return any(oks)
+    return all(oks)
+
+
+def _capture_task_output(
+    store: ResultStore,
+    output_id: str,
+    schema: dict[str, Any],
+    task_name: str,
+    last: ToolResult | None,
+) -> None:
+    """Capture a non-fan-out task's own final tool result as a named output.
+
+    *last* is this task's produced result (its branch's last tool result, or
+    the shell result), **not** the run-global store's last entry -- so a task
+    that produced nothing yields ``None`` (or a hard failure when a schema is
+    declared) rather than silently leaking the previous task's result. When
+    *schema* is non-empty the decoded value is validated against it (raising a
+    clear error on mismatch); otherwise the decoded value is stored as-is,
+    falling back to the raw text when it is not JSON. The result is exposed to
+    later tasks as ``outputs.<output_id>``.
+    """
+    if last is None:
+        if schema:
+            raise ValueError(
+                f"task {task_name!r} declares 'outputs' but produced no tool result to capture"
+            )
+        store.set_output(output_id, None)
+        return
+
+    if schema:
+        value = decode_tool_result(last)
+        validated = validate_output(schema, value)
+        store.set_output(output_id, validated)
+    else:
+        try:
+            value = decode_tool_result(last)
+        except ValueError:
+            value = last.text
+        store.set_output(output_id, value)
+
+
+async def _deploy_with_transport_retry(
+    deploy: Callable[[Any, ResolvedModel], Awaitable[bool]],
+    payload: Any,
+    model: ResolvedModel,
+) -> bool:
+    """Run one branch, retrying it alone on a transient transport failure.
+
+    Retrying here rather than around the whole task is what makes widening
+    the retriable set safe. The task-level loop restarts every branch, so a
+    ``repeat_prompt`` task whose second item loses its response stream would
+    re-execute the first -- and that item may already have written to an
+    external system. A branch that fails here replays only itself; completed
+    siblings keep their results.
+
+    It is also the only level that works for concurrent fan-out at all.
+    ``_fan_out_deploys`` gathers with ``return_exceptions=True`` and turns a
+    branch exception into ``False``, so ``run_prompts`` returns normally and
+    the task-level ``except`` never sees it. Transport failures in that path
+    were previously not retried at any level.
+
+    Capture state is reset between attempts. A ``_Branch`` is reused across
+    them and its tool-result callbacks append to a mutable ``sink``, so an
+    attempt that records a result and then loses its stream would otherwise
+    leave that value behind: ``_final_result`` reads ``sink[-1]``, so it
+    could become the task's named output even though the attempt failed, and
+    projection records every entry into the shared store. Only the attempt
+    that succeeds should be able to publish anything.
+    """
+    for attempt in range(TASK_RETRY_LIMIT):
+        if attempt and isinstance(payload, _Branch):
+            payload.sink.clear()
+            payload.message = None
+            payload.output = None
+            payload.output_set = False
+        try:
+            return await deploy(payload, model)
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except _BRANCH_RETRIABLE_ERRORS as exc:
+            remaining = TASK_RETRY_LIMIT - attempt - 1
+            if remaining <= 0:
+                logging.error(
+                    "Branch failed after %s attempts: %s", TASK_RETRY_LIMIT, exc
+                )
+                raise
+            backoff = TASK_RETRY_BACKOFF * (attempt + 1)
+            # Rendered, not just logged. The task-level loop this replaced
+            # told the operator it was retrying; without this a long audit
+            # would silently pause for the backoff with nothing on screen.
+            await render_model_output(
+                f"** 🤖🔄 Branch failed: {exc}\n"
+                f"** 🤖🔄 Retrying in {backoff}s ({remaining} attempts left)\n"
+            )
+            logging.warning(
+                "Branch attempt %s failed (%s); retrying in %ss (%s left)",
+                attempt + 1, exc, backoff, remaining,
+            )
+            await asyncio.sleep(backoff)
+    # TASK_RETRY_LIMIT is >= 1, so the loop always returns or re-raises.
+    raise RuntimeError("transport retry loop exited without a result")
+
+
+async def _fan_out_deploys(
+    work_items: list[tuple[Any, ResolvedModel]],
+    deploy: Callable[[Any, ResolvedModel], Awaitable[bool]],
+    *,
+    concurrent: bool,
+    concurrency: int,
+    completion_policy: str,
+) -> bool:
+    """Run ``deploy`` for every ``(payload, model)`` work item.
+
+    This is the single place that owns the task fan-out matrix (prompts x
+    models), the concurrency bound, exception isolation, and the completion
+    policy, so the behaviour is unit-testable independently of the agent and
+    MCP machinery.
+
+    Args:
+        work_items: ``(payload, resolved_model)`` pairs to execute. The
+            payload is opaque to this helper and handed back to ``deploy``.
+        deploy: coroutine factory invoked as ``deploy(payload, model)``,
+            returning ``True`` on success.
+        concurrent: when True all deploys run under a bounded ``gather`` and
+            per-branch exceptions are captured and counted as failures; when
+            False they run sequentially and exceptions propagate to the
+            caller's retry loop (preserving the legacy single-model path).
+        concurrency: maximum simultaneous deploys (clamped to >= 1) when
+            ``concurrent`` is True.
+        completion_policy: ``"all"`` or ``"any"`` (see :func:`_completion`).
+
+    Returns:
+        The reduced task success flag.
+    """
+    if not work_items:
+        return True
+
+    if not concurrent:
+        # Sequential path: exceptions propagate exactly as the pre-multi-model
+        # single-model path did, so the caller's retry loop still sees
+        # transient backend errors.
+        oks: list[bool] = []
+        for payload, model in work_items:
+            oks.append(await _deploy_with_transport_retry(deploy, payload, model))
+        return _completion(oks, completion_policy)
+
+    semaphore = asyncio.Semaphore(max(1, concurrency))
+
+    async def _guarded(payload: Any, model: ResolvedModel) -> bool:
+        async with semaphore:
+            return await _deploy_with_transport_retry(deploy, payload, model)
+
+    gathered = await asyncio.gather(
+        *(_guarded(payload, model) for payload, model in work_items),
+        return_exceptions=True,
+    )
+    reduced: list[bool] = []
+    for result in gathered:
+        if not isinstance(result, bool):
+            logging.error("Caught exception in Gather: %s", result, exc_info=result)
+            result = False
+        reduced.append(result)
+    return _completion(reduced, completion_policy)
+
+
+async def _build_prompts_to_run(
+    task_prompt: str,
+    repeat_prompt: bool,
+    store: ResultStore,
+    available_tools: AvailableTools,
+    global_variables: dict[str, Any],
+    inputs: dict[str, Any],
+    outputs: dict[str, Any] | None = None,
+    over: str = "",
+) -> list[str]:
+    """Build the list of prompts to execute for a task.
+
+    For regular tasks the list contains a single rendered prompt.  When
+    ``repeat_prompt`` is enabled, an iterable is derived and a prompt is
+    rendered for each element:
+
+    * If ``over`` is set, it is evaluated as an expression against the
+      template context (``globals`` / ``inputs`` / ``outputs``) to yield the
+      iterable directly. This is the explicit, typed path and does not consume
+      the tool-result carry-over.
+    * Otherwise the previous task's last tool result is decoded from *store*
+      (the legacy path), and consumed (popped) after all prompts render.
+
+    Args:
+        task_prompt: The raw or pre-rendered prompt template string.
+        repeat_prompt: Whether to expand prompts over an iterable.
+        store: Per-run result store providing the last tool result.
+        available_tools: Tool registry (passed through to template rendering).
+        global_variables: Global template variables.
+        inputs: Task-level input variables.
+        outputs: Named task outputs available as ``outputs.<id>``.
+        over: Optional expression selecting the iterable explicitly.
+
+    Returns:
+        List of rendered prompt strings to execute.
+
+    Raises:
+        IndexError: If the legacy path has no previous tool result.
+        ValueError: If the legacy path's tool result is not valid JSON.
+        TypeError: If the derived value is not iterable.
+    """
+    outputs = outputs or {}
+    prompts_to_run: list[str] = []
+    if repeat_prompt:
+        if "result" not in task_prompt.lower():
+            logging.warning("repeat_prompt enabled but no {{ result }} in prompt")
+
+        if over:
+            # Explicit, typed iterable: evaluate the expression against the
+            # full template context. Does not consume the carry-over stack.
+            try:
+                iterable_result = evaluate_expression(
+                    over,
+                    available_tools,
+                    globals_dict=global_variables,
+                    inputs_dict=inputs,
+                    outputs_dict=outputs,
+                )
+            except jinja2.TemplateError as exc:
+                logging.critical("Could not evaluate over expression %r: %s", over, exc)
+                raise ValueError(f"Failed to evaluate 'over' expression: {exc}") from exc
+        else:
+            last = store.last()
+            if last is None:
+                logging.critical("No last tool result available")
+                raise IndexError("No last tool result available for repeat_prompt")
+            iterable_result = decode_tool_result(last)
+
+        # Materialise before testing/iterating: an ``over:`` expression may
+        # yield a one-shot iterator (e.g. Jinja ``map``/``select`` filters),
+        # which is always truthy and would defeat the emptiness check and be
+        # consumed by a single pass. ``list(...)`` also raises TypeError for a
+        # genuinely non-iterable value.
+        try:
+            items = list(iterable_result)
+        except TypeError:
+            logging.critical("repeat_prompt iterable is not iterable: %r", iterable_result)
+            raise
+
+        if not items:
+            await render_model_output("** 🤖❗repeat_prompt iterable is empty!\n")
+        else:
+            logging.debug("Rendering templated prompts for results: %s", items)
+            for value in items:
+                try:
+                    rendered_prompt = render_template(
+                        template_str=task_prompt,
+                        available_tools=available_tools,
+                        globals_dict=global_variables,
+                        inputs_dict=inputs,
+                        result_value=value,
+                        outputs_dict=outputs,
+                    )
+                    prompts_to_run.append(rendered_prompt)
+                except jinja2.TemplateError as e:
+                    logging.error("Error rendering template for result %s: %s", value, e)
+                    raise ValueError(f"Template rendering failed: {e}")
+
+        # Legacy path consumes the tool result only after all prompts rendered
+        # successfully, so it remains available for retry/resume on failure.
+        # The explicit ``over`` path reads named data and never consumes.
+        if not over:
+            store.pop_last()
+    else:
+        prompts_to_run.append(task_prompt)
+    return prompts_to_run
+
+
+async def deploy_task_agents(
+    available_tools: AvailableTools,
+    agents: dict[str, PersonalityDocument],
+    prompt: str,
+    *,
+    async_task: bool = False,
+    toolboxes_override: list[str] | None = None,
+    blocked_tools: list[str] | None = None,
+    headless: bool = False,
+    exclude_from_context: bool = False,
+    max_turns: int = DEFAULT_MAX_TURNS,
+    model: str = DEFAULT_MODEL,
+    model_par: dict[str, Any] | None = None,
+    api_type: str = "chat_completions",
+    endpoint: str | None = None,
+    token: str | None = None,
+    backend: str | None = None,
+    run_hooks: TaskRunHooks | None = None,
+    agent_hooks: TaskAgentHooks | None = None,
+    stream_label: str | None = None,
+    record_tool_result: Callable[[ToolResult], Awaitable[None]] | None = None,
+    record_usage: Callable[[Any], Awaitable[None]] | None = None,
+    record_message: Callable[[str], Awaitable[None]] | None = None,
+    reset_capture: Callable[[], Awaitable[None]] | None = None,
+) -> bool:
+    """Deploy and run task agents with MCP servers.
+
+    Args:
+        available_tools: Tool registry.
+        agents: Mapping of agent name -> PersonalityDocument.
+        prompt: User prompt to execute.
+        api_type: OpenAI API type -- ``"chat_completions"`` or ``"responses"``.
+        endpoint: Optional per-model API endpoint URL override.
+        token: Optional env var name to resolve as the API token.
+        backend: Optional explicit SDK adapter name (``"openai_agents"`` or
+            ``"copilot_sdk"``). Defaults to ``SECLAB_TASKFLOW_BACKEND`` or
+            an endpoint-based auto-default.
+        stream_label: Optional human-readable label for this run's buffered
+            output block (used to tag per-model streams in multi-model tasks).
+            Only takes effect when ``async_task`` is True.
+        record_tool_result: Neutral sink for tool results surfaced by backends
+            that stream ``ToolEnd`` events (copilot/anthropic). The openai
+            adapter captures results via ``run_hooks.on_tool_end`` instead.
+        record_usage: Neutral sink for ``TokenUsage`` events emitted by every
+            adapter, used to gather per-task token accounting for the manifest.
+        record_message: Neutral sink for the agent's final response text,
+            forwarded once the stream completes. Used by ``capture: response``
+            tasks to store the model's prose answer as their named output.
+
+    Returns:
+        True if the task completed successfully.
+    """
+    model_par = model_par or {}
+    toolboxes_override = toolboxes_override or []
+    blocked_tools = blocked_tools or []
+
+    task_id = str(uuid.uuid4())
+    await render_model_output(f"** 🤖💪 Deploying Task Flow Agent(s): {list(agents.keys())}\n")
+    await render_model_output(f"** 🤖💪 Task ID : {task_id}\n")
+    await render_model_output(f"** 🤖💪 Model   : {model}{', params: ' + str(model_par) if model_par else ''}\n")
+    if endpoint:
+        await render_model_output(f"** 🤖💪 Endpoint: {endpoint}\n")
+
+    # Resolve toolboxes from personality definitions or override
+    toolboxes: list[str] = []
+    if toolboxes_override:
+        toolboxes = toolboxes_override
+    else:
+        for personality in agents.values():
+            for tb in personality.toolboxes:
+                if tb not in toolboxes:
+                    toolboxes.append(tb)
+
+    # Resolve the SDK adapter; it validates each spec just before build().
+    backend_name = resolve_backend_name(explicit=backend, endpoint=endpoint)
+    backend_impl = get_backend(backend_name)
+
+    # Pass the user-provided model_settings through verbatim. The
+    # openai-agents adapter applies its own tool_choice / temperature /
+    # parallel_tool_calls defaults; the copilot adapter consumes only
+    # ``reasoning_effort``.
+    model_params: dict[str, Any] = dict(model_par)
+
+    # Build MCP servers and collect server prompts
+    entries = build_mcp_servers(available_tools, toolboxes, blocked_tools, headless)
+    mcp_params = mcp_client_params(available_tools, toolboxes)
+    server_prompts = [sp for _, (_, _, sp, _) in mcp_params.items()]
+
+    # Wrap each built MCP server in a neutral spec. The openai
+    # adapter unwraps ``params["_native"]``; the Copilot adapter reads
+    # ``kind`` plus the raw transport keys.
+    mcp_specs: list[MCPServerSpec] = []
+    for entry in entries:
+        raw_params, *_ = mcp_params.get(entry.server.name, ({}, [], "", 0.0))
+        mcp_specs.append(
+            MCPServerSpec(
+                name=entry.server.name,
+                kind=raw_params.get("kind", "stdio"),
+                params={**raw_params, "_native": entry.server},
+            )
+        )
+
+    # Connect MCP servers
+    servers_connected = asyncio.Event()
+    start_cleanup = asyncio.Event()
+    mcp_sessions = asyncio.create_task(mcp_session_task(entries, servers_connected, start_cleanup))
+
+    await servers_connected.wait()
+    logging.debug("All mcp servers are connected!")
+
+    agent_handle = None
+    try:
+        important_guidelines = [
+            "Do not prompt the user with questions.",
+            "Run tasks until a final result is available.",
+            "Ensure responses are based on the latest information from available tools.",
+            "Run tools sequentially, wait until one tool has completed before calling the next.",
+        ]
+
+        # Build handoff and primary AgentSpecs. The multi-personality case
+        # sets in_handoff_graph=True on every participant so the openai
+        # adapter can apply prompt_with_handoff_instructions equivalently
+        # to the pre-refactor behaviour.
+        agent_names = list(agents.keys())
+        has_handoffs = len(agent_names) > 1
+        handoff_specs: list[AgentSpec] = []
+        for handoff_name in agent_names[1:]:
+            personality = agents[handoff_name]
+            handoff_specs.append(
+                AgentSpec(
+                    name=compress_name(handoff_name),
+                    instructions=mcp_system_prompt(
+                        personality.personality,
+                        personality.task,
+                        server_prompts=server_prompts,
+                        important_guidelines=important_guidelines,
+                    ),
+                    model=model,
+                    model_settings=model_params,
+                    mcp_servers=mcp_specs,
+                    handoffs=[],
+                    exclude_from_context=exclude_from_context,
+                    api_type=api_type,
+                    endpoint=endpoint,
+                    token_env=token,
+                    in_handoff_graph=has_handoffs,
+                    blocked_tools=blocked_tools,
+                    headless=headless,
+                )
+            )
+
+        primary_name = agent_names[0]
+        primary_personality = agents[primary_name]
+        primary_spec = AgentSpec(
+            name=primary_name,
+            instructions=mcp_system_prompt(
+                primary_personality.personality,
+                primary_personality.task,
+                server_prompts=server_prompts,
+                important_guidelines=important_guidelines,
+            ),
+            model=model,
+            model_settings=model_params,
+            mcp_servers=mcp_specs,
+            handoffs=handoff_specs,
+            exclude_from_context=exclude_from_context,
+            api_type=api_type,
+            endpoint=endpoint,
+            token_env=token,
+            in_handoff_graph=has_handoffs,
+            blocked_tools=blocked_tools,
+            headless=headless,
+        )
+        # Validate every spec (handoffs first, then primary) before
+        # touching the backend so capability errors surface upfront.
+        for spec in (*handoff_specs, primary_spec):
+            backend_impl.validate(spec)
+        agent_handle = await backend_impl.build(
+            primary_spec, run_hooks=run_hooks, agent_hooks=agent_hooks
+        )
+
+        try:
+            complete = False
+
+            await drive_backend_stream(
+                backend_impl=backend_impl,
+                agent_handle=agent_handle,
+                prompt=prompt,
+                max_turns=max_turns,
+                run_hooks=run_hooks,
+                async_task=async_task,
+                task_id=task_id,
+                initial_rate_limit_backoff=RATE_LIMIT_BACKOFF,
+                max_rate_limit_backoff=MAX_RATE_LIMIT_BACKOFF,
+                record_tool_result=record_tool_result,
+                record_usage=record_usage,
+                record_message=record_message,
+                reset_capture=reset_capture,
+            )
+            complete = True
+
+        except BackendMaxTurnsError as e:
+            await render_model_output(f"** 🤖❗ Max Turns Reached: {e}\n", async_task=async_task, task_id=task_id)
+            logging.exception("Exceeded max_turns: %s", max_turns)
+        except BackendUnexpectedError as e:
+            await render_model_output(f"** 🤖❗ Agent Exception: {e}\n", async_task=async_task, task_id=task_id)
+            logging.exception("Agent Exception")
+        except BackendBadRequestError as e:
+            await render_model_output(f"** 🤖❗ Request Error: {e}\n", async_task=async_task, task_id=task_id)
+            logging.exception("Bad Request")
+        except BackendTimeoutError as e:
+            await render_model_output(f"** 🤖❗ Timeout Error: {e}\n", async_task=async_task, task_id=task_id)
+            logging.exception("API Timeout")
+            # Propagate rather than returning False. This is the only
+            # transient class the handlers above would otherwise swallow,
+            # and swallowing it hides the failure from
+            # _deploy_with_transport_retry, which is now the sole owner of
+            # transient retry. Returning False here would give an idle
+            # stream exactly one attempt and report it as a branch that
+            # simply did not complete.
+            raise
+
+        return complete
+
+    finally:
+        # Flush here rather than on the success path alone, so that every
+        # exit releases this attempt's buffered output. task_id is unique
+        # per call, so an attempt that propagates -- the re-raised timeout
+        # above, or BackendTransportError and the builtins, which have no
+        # handler here -- would otherwise strand its partial response and
+        # its own diagnostic in the router under an id no later attempt
+        # knows. OutputRouter.flush pops the buffer and no-ops when it is
+        # absent, so this is safe on the paths that already returned.
+        if async_task:
+            await flush_async_output(task_id, label=stream_label)
+        watchdog_ping()
+        if agent_handle is not None:
+            try:
+                await backend_impl.aclose(agent_handle)
+            except Exception:  # noqa: BLE001 - best-effort release
+                logging.exception("Backend aclose failed")
+        start_cleanup.set()
+        cleanup_attempts_left = len(entries)
+        while cleanup_attempts_left and entries:
+            try:
+                cleanup_attempts_left -= 1
+                await asyncio.wait_for(mcp_sessions, timeout=MCP_CLEANUP_TIMEOUT)
+            except asyncio.TimeoutError:
+                continue
+            except Exception:
+                logging.exception("Exception in mcp server cleanup task")
+        # Yield to give mcp_session_task a chance to finish after being
+        # signalled, especially when there are no servers to clean up.
+        await asyncio.sleep(0)
+        # If the MCP session task is still running (e.g. all servers were
+        # already disconnected and the cleanup loop above never entered)
+        # cancel it explicitly so a dangling task can't keep the event
+        # loop alive past run_main.
+        if not mcp_sessions.done():
+            mcp_sessions.cancel()
+            try:
+                await asyncio.wait_for(mcp_sessions, timeout=MCP_CLEANUP_TIMEOUT)
+            except asyncio.TimeoutError:
+                logging.warning(
+                    "Timed out waiting for MCP session task cancellation after %ds",
+                    MCP_CLEANUP_TIMEOUT,
+                )
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logging.exception("Exception while cancelling MCP session task")
+
+
+async def run_main(
+    available_tools: AvailableTools,
+    personality_path: str | None,
+    taskflow_path: str | None,
+    cli_globals: dict[str, str],
+    prompt: str | None,
+    resume_session_id: str | None = None,
+    cli_model_config: str | None = None,
+) -> None:
+    """Main entry point for taskflow/personality execution.
+
+    Args:
+        available_tools: Tool registry.
+        personality_path: Personality module path, or None.
+        taskflow_path: Taskflow module path, or None.
+        cli_globals: Global variables from CLI.
+        prompt: User prompt text.
+        resume_session_id: Session ID to resume from a checkpoint.
+        cli_model_config: Model configuration module path, or None.
+    """
+    from .session import TaskflowSession
+
+    # Daemon thread that force-exits the process if the event loop stops
+    # making progress for any reason the asyncio-layer timeouts didn't
+    # already handle. Idempotent — safe to call on every run_main.
+    start_watchdog()
+
+    # Give this run its own output router so buffered async / multi-model
+    # streams stay isolated from any other run sharing the process.
+    use_output_router(OutputRouter())
+
+    store = ResultStore()
+    usage_store = UsageAccumulator()
+
+    async def on_tool_end_hook(context: RunContextWrapper[TContext], agent: Agent[TContext], tool: Tool, result: str) -> None:
+        # openai-agents delivers tool results here as a backend-specific
+        # serialised string; normalise to a neutral ToolResult before storing.
+        watchdog_ping()
+        store.record(normalize_openai_tool_output(result, tool_name=getattr(tool, "name", "")))
+
+    async def record_tool_result(tool_result: ToolResult) -> None:
+        # Neutral sink for backends (copilot/anthropic) that surface tool
+        # results as stream events rather than via openai-agents RunHooks.
+        watchdog_ping()
+        store.record(tool_result)
+
+    async def record_usage(usage: Any) -> None:
+        # Neutral sink for TokenUsage events from every adapter; accumulated
+        # into a run-level total and attributed to tasks by snapshot delta.
+        usage_store.add(usage)
+
+    async def on_tool_start_hook(context: RunContextWrapper[TContext], agent: Agent[TContext], tool: Tool) -> None:
+        watchdog_ping()
+        await render_model_output(f"\n** 🤖🛠️ Tool Call: {tool.name}\n")
+
+    async def on_handoff_hook(context: RunContextWrapper[TContext], agent: Agent[TContext], source: Agent[TContext]) -> None:
+        await render_model_output(f"\n** 🤖🤝 Agent Handoff: {source.name} -> {agent.name}\n")
+
+    if personality_path:
+        personality = available_tools.get_personality(personality_path)
+        try:
+            await deploy_task_agents(
+                available_tools,
+                {personality_path: personality},
+                prompt or "",
+                run_hooks=TaskRunHooks(on_tool_end=on_tool_end_hook, on_tool_start=on_tool_start_hook),
+                record_tool_result=record_tool_result,
+                record_usage=record_usage,
+            )
+        except (BackendTimeoutError, BackendTransportError) as exc:
+            # The single-personality path has no branch above it to retry,
+            # so both transient classes report and move on, matching the
+            # behaviour this path had for timeouts before retry moved to
+            # the branch. deploy_task_agents renders its own message for
+            # BackendTimeoutError but has no handler for
+            # BackendTransportError, so that one is rendered here or the
+            # user gets a bare traceback.
+            if isinstance(exc, BackendTransportError):
+                await render_model_output(f"** 🤖❗ Connection Lost: {exc}\n")
+            logging.exception("Transient failure running %r", personality_path)
+
+    if taskflow_path or resume_session_id:
+        # Handle session resume
+        session: TaskflowSession | None = None
+        if resume_session_id:
+            session = TaskflowSession.load(resume_session_id)
+            if session.finished:
+                await render_model_output(f"** 🤖✅ Session {resume_session_id} already completed\n")
+                return
+            taskflow_path = session.taskflow_path
+            cli_globals = session.cli_globals
+            prompt = session.prompt
+            store = ResultStore.from_snapshot(session.result_snapshot)
+            # Restore persisted model config unless explicitly overridden
+            if not cli_model_config and session.cli_model_config:
+                cli_model_config = session.cli_model_config
+            await render_model_output(
+                f"** 🤖🔄 Resuming session {resume_session_id} from task {session.next_task_index}\n"
+            )
+
+        taskflow_doc = available_tools.get_taskflow(taskflow_path)
+        await render_model_output(f"** 🤖💪 Running Task Flow: {taskflow_path}\n")
+
+        # Resolve global variables (file defaults + CLI overrides)
+        global_variables = dict(taskflow_doc.globals or {})
+        if cli_globals:
+            global_variables.update(cli_globals)
+
+        # Resolve model config
+        model_config_ref = taskflow_doc.model_config_ref
+        if cli_model_config:
+            model_config_ref = cli_model_config
+        model_keys: list[str] = []
+        model_dict: dict[str, str] = {}
+        models_params: dict[str, dict[str, Any]] = {}
+        api_type: str = "chat_completions"
+        backend: str | None = None
+        if model_config_ref:
+            model_keys, model_dict, models_params, api_type, backend = _resolve_model_config(
+                available_tools, model_config_ref
+            )
+
+        # Create session if this is a new run (not personality mode)
+        if session is None:
+            session = TaskflowSession(
+                taskflow_path=taskflow_path,
+                cli_globals=cli_globals,
+                prompt=prompt or "",
+                total_tasks=len(taskflow_doc.taskflow),
+                cli_model_config=cli_model_config or "",
+            )
+            session.save()
+            await render_model_output(f"** 🤖📋 Session: {session.session_id}\n")
+
+        for task_index, task_wrapper in enumerate(taskflow_doc.taskflow):
+            # Skip already-completed tasks on resume
+            if task_index < session.next_task_index:
+                await render_model_output(
+                    f"** 🤖⏭️ Skipping completed task {task_index}\n"
+                )
+                continue
+
+            task = task_wrapper.task
+
+            # Reusable taskflow support: merge parent defaults into current task
+            if task.uses:
+                task = _merge_reusable_task(available_tools, task)
+
+            # Resolve models (one per model entry; single-model tasks yield
+            # a one-element list). Multi-model tasks fan out over this list.
+            resolved_models = _resolve_task_models(
+                task, model_keys, model_dict, models_params, default_api_type=api_type,
+            )
+            multi_model = len(resolved_models) > 1
+
+            # Read task fields via typed attributes
+            agents_list = task.agents or []
+            headless = task.headless
+            blocked_tools = task.blocked_tools or []
+            run = task.run or ""
+            inputs = task.inputs or {}
+            task_prompt = task.user_prompt or ""
+            if run and task_prompt:
+                raise ValueError("shell task and prompt task are mutually exclusive!")
+            must_complete = task.must_complete
+            max_turns = task.max_steps or DEFAULT_MAX_TURNS
+            toolboxes_override = task.toolboxes or []
+            env = task.env or {}
+            repeat_prompt = task.repeat_prompt
+            # A task "fans out" when it runs more than one branch by intent:
+            # a repeat_prompt (over items) or a multi-model task (over models),
+            # or their cross product. This drives the unified output-capture
+            # model (see the capture design note above ``_aggregate_fanin``):
+            # a task that fans out yields a per-branch fan-in list, one that
+            # does not yields a single value. A shell task (``run``) never fans
+            # out -- it produces no branches -- so it is always a single value.
+            fans_out = (multi_model or repeat_prompt) and not run
+            exclude_from_context = task.exclude_from_context
+            async_task = task.async_task
+            max_concurrent_tasks = task.async_limit
+            completion_policy = task.completion
+            # Bound on concurrent model runs (0 == run all models at once).
+            model_concurrency = task.model_concurrency or len(resolved_models)
+            # Typed named outputs: id names the task's captured output;
+            # outputs declares its schema; over selects a repeat_prompt iterable.
+            task_output_id = task.id
+            task_output_schema = task.outputs or {}
+            # capture: response stores the agent's final response text as the
+            # named output instead of its final tool result.
+            capture_response = task.capture == "response"
+            over = task.over or ""
+            task_name = task.name or f"task-{task_index}"
+
+            # GitHub-Actions-style conditional: when `if` is set, run the task
+            # only if the expression evaluates truthy against the template
+            # context (globals / inputs / outputs). Referencing context that
+            # does not exist yet (e.g. an output from a skipped upstream task)
+            # is treated as falsy -> skip, matching GitHub Actions semantics; a
+            # malformed expression is a hard, resumable failure.
+            if task.if_:
+                try:
+                    condition = evaluate_expression(
+                        task.if_,
+                        available_tools,
+                        globals_dict=global_variables,
+                        inputs_dict=inputs,
+                        outputs_dict=store.outputs,
+                    )
+                    # Coerce truthiness inside the try so that an expression
+                    # evaluating to an undefined value raises UndefinedError
+                    # here (treated as falsy -> skip) rather than during the
+                    # `if not condition` check below, regardless of Jinja's
+                    # undefined_to_none behaviour.
+                    condition = bool(condition)
+                except jinja2.UndefinedError:
+                    condition = False
+                except jinja2.TemplateError as e:
+                    logging.error("Invalid task 'if' condition %r: %s", task.if_, e)
+                    session.mark_failed(f"Task {task_name!r} has an invalid 'if' condition: {e}")
+                    await render_model_output(
+                        f"** 🤖❗ Invalid 'if' condition: {e}\n"
+                        f"** 🤖💾 Session saved: {session.session_id}\n"
+                        f"** 🤖💡 Resume with: --resume {session.session_id}\n"
+                    )
+                    raise ValueError(f"Failed to evaluate task 'if' condition: {e}") from e
+                if not condition:
+                    await render_model_output(
+                        f"** 🤖⏭️ Skipping task {task_name!r} (if condition is false)\n"
+                    )
+                    session.record_task(
+                        index=task_index,
+                        name=task_name,
+                        success=True,
+                        skipped=True,
+                        result_snapshot=store.snapshot(),
+                    )
+                    continue
+
+            # Render prompt template (skip if repeat_prompt — result not yet available)
+            if task_prompt and not repeat_prompt:
+                try:
+                    task_prompt = render_template(
+                        template_str=task_prompt,
+                        available_tools=available_tools,
+                        globals_dict=global_variables,
+                        inputs_dict=inputs,
+                        outputs_dict=store.outputs,
+                    )
+                except jinja2.TemplateError as e:
+                    logging.error("Template rendering error: %s", e)
+                    raise ValueError(f"Failed to render prompt template: {e}") from e
+
+            with TmpEnv(env, context={"globals": global_variables}):
+                prompts_to_run: list[str] = await _build_prompts_to_run(
+                    task_prompt, repeat_prompt, store,
+                    available_tools, global_variables, inputs,
+                    outputs=store.outputs, over=over,
+                )
+
+                # run_prompts hands the branches it built back to the task loop
+                # (via this closure var) so projection + output capture happen
+                # once, after the retry loop, rather than per attempt.
+                captured_branches: list[_Branch] = []
+
+                async def run_prompts(async_task: bool = False, max_concurrent_tasks: int = 5) -> bool:
+                    if run:
+                        await render_model_output("** 🤖🐚 Executing Shell Task\n")
+                        try:
+                            content = shell_tool_call(run).content[0]
+                            store.record(ToolResult(tool_name="shell", text=getattr(content, "text", "")))
+                            return True
+                        except RuntimeError as e:
+                            await render_model_output(f"** 🤖❗ Shell Task Exception: {e}\n")
+                            logging.exception("Shell task error")
+                            return False
+
+                    # Resolve agents (and rewrite bare prompts) once per prompt,
+                    # before fanning out across models so the work is not
+                    # repeated per model.
+                    resolved_prompts: list[tuple[dict[str, Any], str]] = []
+                    for p_prompt in prompts_to_run:
+                        resolved_agents: dict[str, Any] = {}
+                        current_agents = list(agents_list)
+                        if not current_agents:
+                            from .prompt_parser import parse_prompt_args
+                            p_val, _, _, _, p_prompt, _ = parse_prompt_args(available_tools, p_prompt)
+                            if p_val:
+                                current_agents.append(p_val)
+                        for agent_name in current_agents:
+                            personality = available_tools.get_personality(agent_name)
+                            if personality is None:
+                                raise ValueError(f"No such personality: {agent_name}")
+                            resolved_agents[agent_name] = personality
+
+                        if not resolved_agents:
+                            raise ValueError(
+                                "No agents resolved for this task. "
+                                "Specify a personality with -p or provide an agents list."
+                            )
+                        resolved_prompts.append((resolved_agents, p_prompt))
+
+                    # Execution matrix: prompts x models. ``cross`` is a true
+                    # multi-model x repeat_prompt fan-out (more than one prompt
+                    # AND more than one model).
+                    cross = multi_model and len(resolved_prompts) > 1
+                    branches: list[_Branch] = []
+                    for item_index, (ra, pp) in enumerate(resolved_prompts):
+                        for rm in resolved_models:
+                            label = rm.label
+                            if cross:
+                                label = f"{rm.label} [item {item_index}]"
+                            branches.append(
+                                _Branch(agents=ra, prompt=pp, rm=rm, item_index=item_index, label=label)
+                            )
+
+                    # Concurrency: single-model repeat_prompt async fans out
+                    # over items bounded by async_limit; multi-model (including
+                    # the cross product) fans out over branches bounded by
+                    # model_concurrency (default: all models at once).
+                    concurrent = async_task or multi_model
+                    concurrency = model_concurrency if multi_model else max_concurrent_tasks
+
+                    async def _deploy(branch: _Branch, rm: ResolvedModel) -> bool:
+                        # Every branch captures its tool results into its own
+                        # isolated sink (never the shared store) so concurrent
+                        # branches never interleave and capture is uniform across
+                        # repeat_prompt and multi-model. Single-model results are
+                        # projected back into the shared store after the fan-out
+                        # (see the projection step in the task loop).
+                        async def _branch_tool_end(context, agent, tool, result) -> None:  # noqa: ANN001
+                            watchdog_ping()
+                            branch.sink.append(
+                                normalize_openai_tool_output(result, tool_name=getattr(tool, "name", ""))
+                            )
+
+                        async def _branch_record(tr: ToolResult) -> None:
+                            watchdog_ping()
+                            branch.sink.append(tr)
+
+                        async def _branch_record_message(text: str) -> None:
+                            watchdog_ping()
+                            branch.message = text
+
+                        async def _branch_reset() -> None:
+                            # Any retry below this point replays the turn, so
+                            # whatever the failed attempt recorded must go.
+                            # _final_result reads sink[-1] and projection
+                            # replays every entry into the shared store.
+                            branch.sink.clear()
+                            branch.message = None
+
+                        run_hooks = TaskRunHooks(
+                            on_tool_end=_branch_tool_end, on_tool_start=on_tool_start_hook
+                        )
+                        branch_record = _branch_record
+                        branch_ok = await deploy_task_agents(
+                            available_tools,
+                            branch.agents,
+                            branch.prompt,
+                            async_task=concurrent,
+                            toolboxes_override=toolboxes_override,
+                            blocked_tools=blocked_tools,
+                            headless=headless,
+                            exclude_from_context=exclude_from_context,
+                            max_turns=max_turns,
+                            run_hooks=run_hooks,
+                            record_tool_result=branch_record,
+                            record_usage=record_usage,
+                            record_message=_branch_record_message,
+                            reset_capture=_branch_reset,
+                            model=rm.model,
+                            model_par=rm.model_settings,
+                            api_type=rm.api_type,
+                            endpoint=rm.endpoint,
+                            token=rm.token,
+                            backend=rm.backend or backend,
+                            agent_hooks=TaskAgentHooks(on_handoff=on_handoff_hook),
+                            stream_label=branch.label if multi_model else None,
+                        )
+                        # Typed fan-out output: when the task fans out (repeat
+                        # and/or multi-model) and declares an `outputs` schema,
+                        # validate this branch's result against it. A missing or
+                        # schema-violating result makes it a failed branch,
+                        # folded into the completion policy alongside run
+                        # failures; the validated value feeds fan-in. (A plain,
+                        # non-fan-out task validates its single value later, in
+                        # the capture step.)
+                        if fans_out and task_output_schema:
+                            return _capture_branch_output(
+                                branch,
+                                task_output_schema,
+                                agent_ok=branch_ok,
+                                capture_response=capture_response,
+                            )
+                        return branch_ok
+
+                    work_items = [(branch, branch.rm) for branch in branches]
+                    complete = await _fan_out_deploys(
+                        work_items,
+                        _deploy,
+                        concurrent=concurrent,
+                        concurrency=concurrency,
+                        completion_policy=completion_policy,
+                    )
+
+                    # Hand the branches back to the task loop for projection +
+                    # output capture (done once, after the retry loop).
+                    nonlocal captured_branches
+                    captured_branches = branches
+
+                    return complete
+
+                # Execute the task. Retry on transient failures happens one
+                # level down, per branch, so that a branch which already
+                # succeeded -- and may already have written to an external
+                # system -- is not replayed when a sibling fails.
+                task_complete = False
+                last_task_error: BaseException | None = None
+                task_started = time.monotonic()
+                usage_at_task_start = usage_store.as_dict()
+
+                try:
+                    task_complete = await run_prompts(
+                        async_task=async_task,
+                        max_concurrent_tasks=max_concurrent_tasks,
+                    )
+                    last_task_error = None
+                except (KeyboardInterrupt, SystemExit):
+                    raise
+                except Exception as exc:
+                    # Deliberately no retry here. Transient failures are
+                    # retried per branch in _deploy_with_transport_retry,
+                    # which replays only the branch that failed; retrying
+                    # at this level rebuilds the whole fan-out and re-runs
+                    # branches that already succeeded and already wrote to
+                    # external systems. Anything reaching this point has
+                    # either exhausted its branch retries or is not
+                    # transient.
+                    last_task_error = exc
+                    logging.error("Task %r failed: %s", task_name, exc)
+
+                # If the task failed, save and re-raise
+                if last_task_error is not None:
+                    session.mark_failed(f"Task {task_name!r}: {last_task_error}")
+                    await render_model_output(
+                        f"** 🤖💾 Session saved: {session.session_id}\n"
+                        f"** 🤖💡 Resume with: --resume {session.session_id}\n"
+                    )
+                    raise last_task_error
+
+                if must_complete and not task_complete:
+                    logging.critical("Required task not completed ... aborting!")
+                    await render_model_output("** 🤖💥 Required task not completed ...\n")
+                    session.mark_failed(f"Required task {task_name!r} did not complete")
+                    await render_model_output(
+                        f"** 🤖💾 Session saved: {session.session_id}\n"
+                        f"** 🤖💡 Resume with: --resume {session.session_id}\n"
+                    )
+                    # Raise (rather than break) so run_main propagates the
+                    # failure and the CLI exits non-zero, matching the other
+                    # hard-failure paths; the session is already saved for
+                    # --resume.
+                    raise RuntimeError(f"Required task {task_name!r} did not complete")
+
+                # Projection: replay this task's per-branch tool results into the
+                # shared run store (single-model only) so the implicit
+                # last-tool-result carry-over, the run-level result list, and the
+                # session snapshot behave as before, and deterministically in
+                # branch order even for async repeat_prompt. Multi-model tasks
+                # are excluded on purpose (no well-defined "last" across models;
+                # consume them by name via id/over). Shell tasks have no branches
+                # and already wrote their result to the store directly.
+                if not multi_model:
+                    for _branch in captured_branches:
+                        for _tr in _branch.sink:
+                            store.record(_tr)
+
+                # Capture this task's typed named output, uniform across single-
+                # and multi-model (see the capture design note above
+                # ``_aggregate_fanin``). A task that fans out (repeat_prompt or
+                # multiple models) publishes the per-branch fan-in list; a plain
+                # task publishes its single value, validated against the
+                # ``outputs`` schema here (a violation is a hard failure, with
+                # the same session-saved / resume messaging as other failures).
+                if task_output_id:
+                    if fans_out:
+                        store.set_output(
+                            task_output_id,
+                            _aggregate_fanin(captured_branches, capture_response=capture_response),
+                        )
+                    else:
+                        # This task's own last result: the single branch's last
+                        # tool result (or its final response text under
+                        # capture: response) for a model task, or the shell
+                        # result for a shell task (which has no branches and
+                        # wrote directly to the store). Never the run-global
+                        # store.last(), so an empty producer does not leak the
+                        # previous task's result.
+                        if captured_branches:
+                            _own_last = _branch_result_source(
+                                captured_branches[-1], capture_response=capture_response
+                            )
+                        else:
+                            _own_last = store.last()
+                        try:
+                            _capture_task_output(
+                                store, task_output_id, task_output_schema, task_name, _own_last
+                            )
+                        except Exception as exc:
+                            logging.error("Task %r output capture failed: %s", task_name, exc)
+                            session.mark_failed(f"Task {task_name!r} output capture failed: {exc}")
+                            await render_model_output(
+                                f"** 🤖❗ Output capture failed: {exc}\n"
+                                f"** 🤖💾 Session saved: {session.session_id}\n"
+                                f"** 🤖💡 Resume with: --resume {session.session_id}\n"
+                            )
+                            raise
+
+                # Checkpoint after task (must_complete failures break above
+                # without advancing the resume cursor)
+                session.record_task(
+                    index=task_index,
+                    name=task_name,
+                    success=task_complete,
+                    result_snapshot=store.snapshot(),
+                    models=[] if run else [rm.label for rm in resolved_models],
+                    duration_s=time.monotonic() - task_started,
+                    usage=UsageAccumulator.delta(usage_at_task_start, usage_store.as_dict()),
+                )
+
+        # All tasks completed successfully
+        if session is not None and not session.error:
+            session.mark_finished()
+            await render_model_output(f"** 🤖✅ Session {session.session_id} completed\n")

@@ -1,0 +1,13 @@
+# SPDX-FileCopyrightText: GitHub, Inc.
+# SPDX-License-Identifier: MIT
+
+seclab-taskflow-agent:
+  version: "1.0"
+  filetype: taskflow
+
+globals:
+  test_var: default_value
+taskflow:
+  - task:
+      run: |
+        echo "test"

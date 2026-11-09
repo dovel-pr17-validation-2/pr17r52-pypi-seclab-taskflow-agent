@@ -1,0 +1,16 @@
+# SPDX-FileCopyrightText: GitHub, Inc.
+# SPDX-License-Identifier: MIT
+
+seclab-taskflow-agent:
+  version: "1.0"
+  filetype: taskflow
+
+taskflow:
+  - task:
+      agents:
+        - examples.personalities.fruit_expert
+      inputs:
+        fruit: apples
+      user_prompt: |
+        Tell me more about {{ inputs.fruit }}.
+        

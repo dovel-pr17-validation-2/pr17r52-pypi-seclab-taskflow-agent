@@ -1,0 +1,11 @@
+# SPDX-FileCopyrightText: GitHub, Inc.
+# SPDX-License-Identifier: MIT
+
+seclab-taskflow-agent:
+  version: 1.0
+  filetype: personality
+
+personality: |
+  Test personality with float version.
+task: |
+  Test task.

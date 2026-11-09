@@ -1,0 +1,77 @@
+name: Smoke test - run the examples to check for errors
+
+on:
+  issue_comment:
+    types: [created] # Add "smoke test" as a PR comment to trigger this workflow.
+
+# Permissions needed for reacting and adding comments for IssueOps commands
+# See: https://github.com/github/branch-deploy/blob/ddf8ca48e9cdb2d2c7c71dee428308b19af9313f/README.md?plain=1#L189-L197
+permissions:
+  pull-requests: write # Required for commenting on PRs
+  deployments: write # Required for updating deployment statuses
+  contents: write # Required for reading/writing the lock file
+  checks: read # Required for checking if the CI checks have passed in order to deploy the PR
+  statuses: read # Required for checking if all commit statuses are "success" in order to deploy the PR
+
+jobs:
+  Linux:
+    runs-on: ubuntu-latest
+    environment: smoketest
+    if: github.event.issue.pull_request  # Make sure the comment is on a PR
+    steps:
+      - name: Branch Deploy
+        id: branch-deploy
+        uses: github/branch-deploy@ddf8ca48e9cdb2d2c7c71dee428308b19af9313f # v11.1.4
+        with:
+          trigger: "smoke test"
+          reaction: "eyes"
+          environment: "smoketest"
+          stable_branch: "main"
+          update_branch: "disabled"
+
+      - name: Setup Python
+        if: steps.branch-deploy.outputs.continue == 'true'
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: '3.11'
+
+      - name: Checkout the repo
+        if: steps.branch-deploy.outputs.continue == 'true'
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ steps.branch-deploy.outputs.sha }}
+
+      - name: Setup Python venv
+        if: steps.branch-deploy.outputs.continue == 'true'
+        run: |
+          python -m venv .venv
+          source .venv/bin/activate
+          python -m pip install hatch
+
+      - name: Run tests
+        if: steps.branch-deploy.outputs.continue == 'true'
+        env:
+          MODEL_TEMP: ${{ vars.SMOKETEST_TEMPERATURE }}
+          AI_API_ENDPOINT: ${{ vars.SMOKETEST_ENDPOINT }}
+          AI_API_TOKEN: ${{ secrets.AI_API_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+        run: |
+          source .venv/bin/activate
+          hatch build
+          hatch run main -p seclab_taskflow_agent.personalities.assistant 'explain modems to me please'
+          hatch run main -p seclab_taskflow_agent.personalities.c_auditer 'explain modems to me please'
+          hatch run main -p examples.personalities.echo 'explain modems to me please'
+          hatch run main -t examples.taskflows.CVE-2023-2283
+          hatch run main -t examples.taskflows.echo
+          hatch run main -t examples.taskflows.example
+          hatch run main -t examples.taskflows.example_globals
+          hatch run main -t examples.taskflows.example_inputs
+          hatch run main -t examples.taskflows.example_large_list_result_iter
+          hatch run main -t examples.taskflows.example_repeat_prompt
+          hatch run main -t examples.taskflows.example_repeat_prompt_async
+          hatch run main -t examples.taskflows.example_repeat_prompt_dictionary
+          hatch run main -t examples.taskflows.example_reusable_prompt
+          hatch run main -t examples.taskflows.example_reusable_taskflows
+          hatch run main -t examples.taskflows.example_triage_taskflow
+          hatch run main -t examples.taskflows.single_step_taskflow
